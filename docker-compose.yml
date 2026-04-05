@@ -1,40 +1,39 @@
-x-healthcheck-defaults: &healthcheck-defaults
-  interval: 10s
-  timeout: 5s
-  retries: 5
-  start_period: 30s
-
 services:
+  # Reverse proxy and TLS termination.
   traefik:
     image: traefik:v3.6
-    container_name: traefik
     command:
       - "--configFile=/etc/traefik/traefik.yml"
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.dashboard.rule=Host(`${TRAEFIK_HOST_NAME}`)"
-      - "traefik.http.routers.dashboard.entrypoints=websecure"
-      - "traefik.http.routers.dashboard.service=api@internal"
-      - "traefik.http.routers.dashboard.middlewares=oauth2-proxy@docker"
-    ports:
-      - "80:80"
-      - "443:443"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./configs/traefik/traefik.yml:/etc/traefik/traefik.yml:ro
       - ./configs/traefik/certs:/certs:ro
       - ./configs/traefik/dynamic:/dynamic:ro
-    restart: unless-stopped
-    healthcheck:
-      <<: *healthcheck-defaults
-      test:
-        ["CMD-SHELL", "wget -q --spider http://localhost:8082/ping || exit 1"]
+    ports:
+      - "80:80"
+      - "443:443"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.dashboard.rule=Host(`${TRAEFIK_HOSTNAME}`)"
+      - "traefik.http.routers.dashboard.entrypoints=websecure"
+      - "traefik.http.routers.dashboard.service=api@internal"
+      - "traefik.http.routers.dashboard.middlewares=oauth2-proxy@file"
     networks:
       - proxy
+    healthcheck:
+      test:
+        ["CMD-SHELL", "wget -q --spider http://localhost:8082/ping || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
 
+  # Identity provider.
   keycloak:
     image: quay.io/keycloak/keycloak:26.1.0
-    container_name: keycloak
     command:
       - start
     environment:
@@ -47,48 +46,58 @@ services:
     volumes:
       - ./configs/keycloak/keycloak.conf:/opt/keycloak/conf/keycloak.conf:ro
       - ./configs/keycloak/realm-exports:/opt/keycloak/data/import:ro
-    depends_on:
-      keycloak-postgres:
-        condition: service_healthy
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.keycloak.rule=Host(`${KEYCLOAK_HOSTNAME}`)"
       - "traefik.http.routers.keycloak.entrypoints=websecure"
       - "traefik.http.routers.keycloak.tls=true"
       - "traefik.http.services.keycloak.loadbalancer.server.port=8080"
-    restart: unless-stopped
-    healthcheck:
-      <<: *healthcheck-defaults
-      test:
-        ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/localhost/9000 && echo -e \"GET /health/ready HTTP/1.0\\n\\n\" >&3 && timeout 3 cat <&3 | grep -q UP'"]
-      start_period: 60s
     networks:
       - proxy
       - auth
+    depends_on:
+      keycloak-postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "bash -c 'exec 3<>/dev/tcp/localhost/9000 && echo -e \"GET /health/ready HTTP/1.0\\n\\n\" >&3 && timeout 3 cat <&3 | grep -q UP'",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
 
+  # Database for Keycloak.
   keycloak-postgres:
     image: postgres:16.2
-    container_name: keycloak-postgres
-    volumes:
-      - keycloak-postgres_data:/var/lib/postgresql/data
-      - ./configs/keycloak-postgres/keycloak-postgres.conf:/etc/keycloak-postgres/keycloak-postgres.conf:ro
     command: postgres -c config_file=/etc/keycloak-postgres/keycloak-postgres.conf
     environment:
       POSTGRES_DB: ${KEYCLOAK_DB_NAME}
       POSTGRES_USER: ${KEYCLOAK_DB_USER}
       POSTGRES_PASSWORD: ${KEYCLOAK_DB_PASSWORD}
-    restart: unless-stopped
-    healthcheck:
-      <<: *healthcheck-defaults
-      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
-      start_period: 30s
+    volumes:
+      - keycloak-postgres_data:/var/lib/postgresql/data
+      - ./configs/keycloak-postgres/keycloak-postgres.conf:/etc/keycloak-postgres/keycloak-postgres.conf:ro
     networks:
       - auth
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
 
+  # Forward-auth proxy, gates access to protected routes via Keycloak OIDC.
   oauth2-proxy:
     image: quay.io/oauth2-proxy/oauth2-proxy:v7.8.1
-    container_name: oauth2-proxy
-    restart: unless-stopped
     command:
       - --config=/etc/oauth2-proxy/oauth2-proxy.cfg
     environment:
@@ -98,39 +107,41 @@ services:
       OAUTH2_PROXY_COOKIE_SECRET: ${OAUTH2_PROXY_COOKIE_SECRET}
       OAUTH2_PROXY_OIDC_ISSUER_URL: https://${KEYCLOAK_HOSTNAME}/realms/master
       OAUTH2_PROXY_REDIRECT_URL: https://${DOMAIN}/oauth2/callback
+    volumes:
+      - ./configs/oauth2-proxy/oauth2-proxy.cfg:/etc/oauth2-proxy/oauth2-proxy.cfg:ro
+      - ./configs/traefik/certs/local.crt:/etc/ssl/certs/ca.crt:ro
     labels:
       - "traefik.enable=true"
-      - "traefik.http.middlewares.oauth2-proxy.forwardauth.address=http://oauth2-proxy:4180/"
-      - "traefik.http.middlewares.oauth2-proxy.forwardauth.trustForwardHeader=true"
-      - "traefik.http.middlewares.oauth2-proxy.forwardauth.authResponseHeaders=X-Auth-Request-User,X-Auth-Request-Email,X-Auth-Request-Access-Token,Authorization"
       - "traefik.http.routers.oauth2-proxy.rule=Host(`${DOMAIN}`) && PathPrefix(`/oauth2`)"
       - "traefik.http.routers.oauth2-proxy.entrypoints=websecure"
       - "traefik.http.routers.oauth2-proxy.tls=true"
       - "traefik.http.services.oauth2-proxy.loadbalancer.server.port=4180"
-    depends_on:
-      keycloak:
-        condition: service_healthy
     networks:
       - proxy
       - auth
-    volumes:
-      - ./configs/oauth2-proxy/oauth2-proxy.cfg:/etc/oauth2-proxy/oauth2-proxy.cfg:ro
-      - ./configs/traefik/certs/local.crt:/etc/ssl/certs/ca.crt:ro
     extra_hosts:
       - "${KEYCLOAK_HOSTNAME}:host-gateway"
+    depends_on:
+      keycloak:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
 
+  # Demo service.
   whoami:
     image: traefik/whoami
-    container_name: whoami
-    restart: unless-stopped
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.whoami.rule=Host(`${DOMAIN}`) && PathPrefix(`/whoami`)"
       - "traefik.http.routers.whoami.entrypoints=websecure"
       - "traefik.http.routers.whoami.tls=true"
-      - "traefik.http.routers.whoami.middlewares=oauth2-proxy@docker"
+      - "traefik.http.routers.whoami.middlewares=oauth2-proxy@file"
     networks:
       - proxy
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
 
 networks:
   proxy:

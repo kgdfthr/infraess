@@ -2,23 +2,27 @@ http:
   middlewares:
     secure-headers:
       headers:
-        # Without HSTS, an attacker on the same network can intercept the initial HTTP request before the redirect happens.
+        # HSTS for 1 year, including subdomains, eligible for browser preload lists.
         stsSeconds: 31536000
-        # Subdomains are equally vulnerable to SSL stripping excluding them would leave an exploitable gap.
         stsIncludeSubdomains: true
-        # Preloading eliminates the very first unprotected connection, which HSTS alone cannot protect.
         stsPreload: true
-        # Without this, HSTS only activates after the first HTTPS response — the first request is still unprotected.
+        # Send HSTS on every response, not just after the browser has cached it.
         forceSTSHeader: true
-        # Without this, browsers may execute files as a different type than declared, enabling content injection attacks.
         contentTypeNosniff: true
-        # Older browsers have no CSP support this header activates their only available XSS protection mechanism.
-        browserXssFilter: true
-        # Without a policy, the full URL including paths and query strings leaks to every external resource the page loads.
         referrerPolicy: "strict-origin-when-cross-origin"
-        # Without explicit restrictions, any injected script can silently access camera, microphone, or location.
         permissionsPolicy: "camera=(), microphone=(), geolocation=()"
+
     rate-limit:
       rateLimit:
         average: 100
         burst: 50
+
+    oauth2-proxy:
+      forwardAuth:
+        address: "http://oauth2-proxy:4180/"
+        trustForwardHeader: true
+        authResponseHeaders:
+          - "X-Auth-Request-User"
+          - "X-Auth-Request-Email"
+        # oauth2-proxy returns no body on auth responses — cap size to prevent memory exhaustion.
+        maxResponseBodySize: 32768

@@ -1,4 +1,5 @@
 entryPoints:
+  # Redirects all HTTP traffic to HTTPS.
   web:
     address: ":80"
     http:
@@ -7,25 +8,34 @@ entryPoints:
           to: websecure
           scheme: https
           permanent: true
+  # Main HTTPS entrypoint — secure-headers and rate-limit applied to all routes by default.
   websecure:
     address: ":443"
     http:
+      middlewares:
+        - secure-headers@file
+        - rate-limit@file
       tls: {}
+  # Isolated entrypoint for healthcheck — not exposed publicly.
   internal:
     address: ":8082"
 
 providers:
   docker:
+    # Containers must explicitly opt in via the traefik.enable=true label.
     exposedByDefault: false
     network: proxy
   file:
     directory: /dynamic
+    # Reload dynamic config on change without restarting Traefik.
     watch: true
 
 api:
   dashboard: true
+  # Dashboard is accessible only via the router defined in docker-compose labels.
   insecure: false
 
+# Ping runs on the internal entrypoint so healthcheck traffic stays off the public port.
 ping:
   entryPoint: internal
 
@@ -38,6 +48,7 @@ accessLog:
   fields:
     defaultMode: keep
     headers:
+      # Drop all headers by default to avoid logging sensitive values.
       defaultMode: drop
       names:
         User-Agent: keep
