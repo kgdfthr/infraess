@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>infraess demo</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, sans-serif; background: #f8fafc; color: #0f172a; padding: 2rem; }
+
+    header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem; }
+    header h1 { font-size: 1.4rem; color: #0f172a; }
+    .user-info { display: flex; align-items: center; gap: 0.75rem; }
+    .avatar { width: 36px; height: 36px; border-radius: 50%; background: #2563eb; color: white; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 0.9rem; }
+    .user-name { font-weight: 600; font-size: 0.9rem; }
+    .user-email { font-size: 0.75rem; color: #64748b; }
+
+    .badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 4px; font-size: 0.7rem; font-weight: 700; margin-right: 0.25rem; }
+    .badge-reader { background: #dbeafe; color: #1d4ed8; }
+    .badge-writer { background: #dcfce7; color: #15803d; }
+    .badge-admin  { background: #ede9fe; color: #7c3aed; }
+    .badge-none   { background: #f1f5f9; color: #64748b; }
+
+    .btn-logout { padding: 0.4rem 0.9rem; border-radius: 6px; border: 1px solid #e2e8f0; background: white; color: #64748b; font-size: 0.8rem; cursor: pointer; }
+    .btn-logout:hover { background: #f1f5f9; }
+
+    .section { background: white; border: 1px solid #e2e8f0; border-radius: 8px; padding: 1.5rem; margin-bottom: 1.5rem; }
+    .section-header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 1rem; }
+    .section-header h2 { font-size: 0.95rem; font-weight: 600; }
+    .section-header .hint { font-size: 0.75rem; color: #94a3b8; }
+
+    table { width: 100%; border-collapse: collapse; }
+    th { text-align: left; padding: 0.5rem 0.75rem; color: #64748b; font-size: 0.75rem; font-weight: 600; text-transform: uppercase; border-bottom: 1px solid #e2e8f0; }
+    td { padding: 0.6rem 0.75rem; border-bottom: 1px solid #f1f5f9; font-size: 0.9rem; }
+    tr:last-child td { border-bottom: none; }
+
+    .btn-delete { padding: 0.25rem 0.6rem; border-radius: 4px; border: none; cursor: pointer; font-size: 0.75rem; font-weight: 600; background: #fee2e2; color: #dc2626; }
+    .btn-delete:hover { background: #fecaca; }
+    .btn-create { padding: 0.5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.85rem; font-weight: 600; background: #2563eb; color: white; }
+    .btn-create:hover { background: #1d4ed8; }
+
+    input, textarea { background: #f8fafc; border: 1px solid #e2e8f0; color: #0f172a; border-radius: 6px; padding: 0.5rem 0.75rem; width: 100%; margin-bottom: 0.5rem; font-size: 0.9rem; font-family: inherit; }
+    input:focus, textarea:focus { outline: none; border-color: #2563eb; }
+
+    .error { color: #dc2626; font-size: 0.8rem; margin-top: 0.5rem; }
+    .success { color: #15803d; font-size: 0.8rem; margin-top: 0.5rem; }
+
+    .config-item { display: flex; justify-content: space-between; padding: 0.5rem 0; border-bottom: 1px solid #f1f5f9; font-size: 0.9rem; }
+    .config-item:last-child { border-bottom: none; }
+    .config-key { color: #64748b; }
+    .config-val { font-family: monospace; color: #7c3aed; }
+
+    .roles-row { margin-top: 0.25rem; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>infraess demo</h1>
+  <div class="user-info">
+    <div class="avatar" id="avatar">?</div>
+    <div>
+      <div class="user-name" id="username">loading...</div>
+      <div class="roles-row" id="roles"></div>
+    </div>
+    <button class="btn-logout" onclick="logout()">Sign out</button>
+  </div>
+</header>
+
+<div class="section">
+  <div class="section-header">
+    <h2>Articles</h2>
+    <span class="hint">GET /api/articles — role:reader+</span>
+  </div>
+  <table>
+    <thead><tr><th>ID</th><th>Title</th><th>Content</th><th></th></tr></thead>
+    <tbody id="articles-body"></tbody>
+  </table>
+  <p id="articles-error" class="error"></p>
+</div>
+
+<div class="section" id="create-section" style="display:none">
+  <div class="section-header">
+    <h2>Create Article</h2>
+    <span class="hint">POST /api/articles — role:writer+</span>
+  </div>
+  <input id="new-title" placeholder="Title" />
+  <textarea id="new-content" placeholder="Content" rows="3"></textarea>
+  <button class="btn-create" onclick="createArticle()">Create</button>
+  <p id="create-msg" class="success"></p>
+  <p id="create-error" class="error"></p>
+</div>
+
+<div class="section" id="config-section">
+  <div class="section-header">
+    <h2>Admin Config</h2>
+    <span class="hint">GET /api/admin/config — role:admin only</span>
+  </div>
+  <div id="config-body"></div>
+  <p id="config-error" class="error"></p>
+</div>
+
+<script>
+  let currentUser = null
+
+  const roleBadge = r => {
+    const cls = { 'role:reader': 'badge-reader', 'role:writer': 'badge-writer', 'role:admin': 'badge-admin' }
+    return `<span class="badge ${cls[r] || 'badge-none'}">${r.replace('role:', '')}</span>`
+  }
+
+  function hasRole(...roles) {
+    if (!currentUser) return false
+    return roles.some(r => currentUser.groups.includes(r))
+  }
+
+  function logout() {
+    window.location.href = '/outpost.goauthentik.io/sign_out'
+  }
+
+  async function loadUser() {
+    const res = await fetch('/api/me')
+    currentUser = await res.json()
+
+    const initials = (currentUser.name || currentUser.username || '?').charAt(0).toUpperCase()
+    document.getElementById('avatar').textContent = initials
+    document.getElementById('username').textContent = currentUser.name || currentUser.username
+    document.getElementById('roles').innerHTML = currentUser.groups.length
+      ? currentUser.groups.map(roleBadge).join('')
+      : '<span class="badge badge-none">no roles</span>'
+
+    if (hasRole('role:writer', 'role:admin')) {
+      document.getElementById('create-section').style.display = 'block'
+    }
+
+    loadArticles()
+    loadConfig()
+  }
+
+  async function loadArticles() {
+    const res = await fetch('/api/articles')
+    const err = document.getElementById('articles-error')
+    if (!res.ok) {
+      err.textContent = '403 — your role cannot read articles'
+      return
+    }
+    const articles = await res.json()
+    document.getElementById('articles-body').innerHTML = articles.map(a => `
+      <tr>
+        <td>${a.id}</td>
+        <td>${a.title}</td>
+        <td>${a.content}</td>
+        <td>${hasRole('role:admin') ? `<button class="btn-delete" onclick="deleteArticle(${a.id})">Delete</button>` : ''}</td>
+      </tr>`).join('')
+  }
+
+  async function createArticle() {
+    const title = document.getElementById('new-title').value.trim()
+    const content = document.getElementById('new-content').value.trim()
+    const err = document.getElementById('create-error')
+    const msg = document.getElementById('create-msg')
+
+    err.textContent = ''
+    msg.textContent = ''
+
+    if (!title) { err.textContent = 'Title is required'; return }
+
+    const res = await fetch('/api/articles', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title, content })
+    })
+
+    if (!res.ok) {
+      err.textContent = '403 — your role cannot create articles'
+      return
+    }
+
+    document.getElementById('new-title').value = ''
+    document.getElementById('new-content').value = ''
+    msg.textContent = 'Article created.'
+    loadArticles()
+  }
+
+  async function deleteArticle(id) {
+    const res = await fetch(`/api/articles/${id}`, { method: 'DELETE' })
+    if (res.ok) loadArticles()
+  }
+
+  async function loadConfig() {
+    const res = await fetch('/api/admin/config')
+    const err = document.getElementById('config-error')
+    if (!res.ok) {
+      err.textContent = '403 — your role cannot access admin config'
+      return
+    }
+    const cfg = await res.json()
+    document.getElementById('config-body').innerHTML = Object.entries(cfg).map(([k, v]) =>
+      `<div class="config-item"><span class="config-key">${k}</span><span class="config-val">${v}</span></div>`
+    ).join('')
+  }
+
+  loadUser()
+</script>
+</body>
+</html>

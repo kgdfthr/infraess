@@ -17,7 +17,7 @@ services:
       - "traefik.http.routers.dashboard.rule=Host(`${TRAEFIK_HOSTNAME}`)"
       - "traefik.http.routers.dashboard.entrypoints=websecure"
       - "traefik.http.routers.dashboard.service=api@internal"
-      - "traefik.http.routers.dashboard.middlewares=oauth2-proxy@file"
+      - "traefik.http.routers.dashboard.middlewares=authentik@file"
     networks:
       - proxy
     healthcheck:
@@ -31,58 +31,15 @@ services:
       - no-new-privileges:true
     restart: unless-stopped
 
-  # Identity provider.
-  keycloak:
-    image: quay.io/keycloak/keycloak:26.1.0
-    command:
-      - start
+  # Identity provider and forward-auth proxy.
+  authentik-postgresql:
+    image: docker.io/library/postgres:16-alpine
     environment:
-      KC_DB_URL: jdbc:postgresql://keycloak-postgres:5432/${KEYCLOAK_DB_NAME}
-      KC_DB_USERNAME: ${KEYCLOAK_DB_USER}
-      KC_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD}
-      KC_HOSTNAME: ${KEYCLOAK_HOSTNAME}
-      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN_USERNAME}
-      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
+      POSTGRES_DB: ${AUTHENTIK_DB_NAME}
+      POSTGRES_USER: ${AUTHENTIK_DB_USER}
+      POSTGRES_PASSWORD: ${AUTHENTIK_DB_PASSWORD}
     volumes:
-      - ./configs/keycloak/keycloak.conf:/opt/keycloak/conf/keycloak.conf:ro
-      - ./configs/keycloak/realm-exports:/opt/keycloak/data/import:ro
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.keycloak.rule=Host(`${KEYCLOAK_HOSTNAME}`)"
-      - "traefik.http.routers.keycloak.entrypoints=websecure"
-      - "traefik.http.routers.keycloak.tls=true"
-      - "traefik.http.services.keycloak.loadbalancer.server.port=8080"
-    networks:
-      - proxy
-      - auth
-    depends_on:
-      keycloak-postgres:
-        condition: service_healthy
-    healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "bash -c 'exec 3<>/dev/tcp/localhost/9000 && echo -e \"GET /health/ready HTTP/1.0\\n\\n\" >&3 && timeout 3 cat <&3 | grep -q UP'",
-        ]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 60s
-    security_opt:
-      - no-new-privileges:true
-    restart: unless-stopped
-
-  # Database for Keycloak.
-  keycloak-postgres:
-    image: postgres:16.2
-    command: postgres -c config_file=/etc/keycloak-postgres/keycloak-postgres.conf
-    environment:
-      POSTGRES_DB: ${KEYCLOAK_DB_NAME}
-      POSTGRES_USER: ${KEYCLOAK_DB_USER}
-      POSTGRES_PASSWORD: ${KEYCLOAK_DB_PASSWORD}
-    volumes:
-      - keycloak-postgres_data:/var/lib/postgresql/data
-      - ./configs/keycloak-postgres/keycloak-postgres.conf:/etc/keycloak-postgres/keycloak-postgres.conf:ro
+      - authentik-postgresql_data:/var/lib/postgresql/data
     networks:
       - auth
     healthcheck:
@@ -95,48 +52,187 @@ services:
       - no-new-privileges:true
     restart: unless-stopped
 
-  # Forward-auth proxy, gates access to protected routes via Keycloak OIDC.
-  oauth2-proxy:
-    image: quay.io/oauth2-proxy/oauth2-proxy:v7.8.1
-    command:
-      - --config=/etc/oauth2-proxy/oauth2-proxy.cfg
-    environment:
-      SSL_CERT_FILE: /etc/ssl/certs/ca.crt
-      OAUTH2_PROXY_CLIENT_ID: ${OAUTH2_PROXY_CLIENT_ID}
-      OAUTH2_PROXY_CLIENT_SECRET: ${OAUTH2_PROXY_CLIENT_SECRET}
-      OAUTH2_PROXY_COOKIE_SECRET: ${OAUTH2_PROXY_COOKIE_SECRET}
-      OAUTH2_PROXY_OIDC_ISSUER_URL: https://${KEYCLOAK_HOSTNAME}/realms/master
-      OAUTH2_PROXY_REDIRECT_URL: https://${DOMAIN}/oauth2/callback
+  authentik-redis:
+    image: docker.io/library/redis:7-alpine
+    command: --save 60 1 --loglevel warning
     volumes:
-      - ./configs/oauth2-proxy/oauth2-proxy.cfg:/etc/oauth2-proxy/oauth2-proxy.cfg:ro
-      - ./configs/traefik/certs/local.crt:/etc/ssl/certs/ca.crt:ro
+      - authentik-redis_data:/data
+    networks:
+      - auth
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+  authentik-server:
+    image: ghcr.io/goauthentik/server:2024.12.3
+    command: server
+    environment:
+      AUTHENTIK_REDIS__HOST: authentik-redis
+      AUTHENTIK_POSTGRESQL__HOST: authentik-postgresql
+      AUTHENTIK_POSTGRESQL__USER: ${AUTHENTIK_DB_USER}
+      AUTHENTIK_POSTGRESQL__NAME: ${AUTHENTIK_DB_NAME}
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${AUTHENTIK_DB_PASSWORD}
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY}
+      AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
+    volumes:
+      - ./data/authentik/media:/media
+      - authentik-templates:/templates
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.oauth2-proxy.rule=Host(`${DOMAIN}`) && PathPrefix(`/oauth2`)"
-      - "traefik.http.routers.oauth2-proxy.entrypoints=websecure"
-      - "traefik.http.routers.oauth2-proxy.tls=true"
-      - "traefik.http.services.oauth2-proxy.loadbalancer.server.port=4180"
+      # Main UI
+      - "traefik.http.routers.authentik.rule=Host(`${AUTHENTIK_HOSTNAME}`)"
+      - "traefik.http.routers.authentik.entrypoints=websecure"
+      - "traefik.http.routers.authentik.tls=true"
+      - "traefik.http.routers.authentik.service=authentik-svc"
+      # Embedded outpost — must be reachable on all protected domains for login redirects.
+      - "traefik.http.routers.authentik-outpost.rule=PathPrefix(`/outpost.goauthentik.io/`)"
+      - "traefik.http.routers.authentik-outpost.entrypoints=websecure"
+      - "traefik.http.routers.authentik-outpost.tls=true"
+      - "traefik.http.routers.authentik-outpost.service=authentik-svc"
+      - "traefik.http.services.authentik-svc.loadbalancer.server.port=9000"
     networks:
       - proxy
       - auth
-    extra_hosts:
-      - "${KEYCLOAK_HOSTNAME}:host-gateway"
     depends_on:
-      keycloak:
+      authentik-postgresql:
+        condition: service_healthy
+      authentik-redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "ak healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+  authentik-worker:
+    image: ghcr.io/goauthentik/server:2024.12.3
+    command: worker
+    environment:
+      AUTHENTIK_REDIS__HOST: authentik-redis
+      AUTHENTIK_POSTGRESQL__HOST: authentik-postgresql
+      AUTHENTIK_POSTGRESQL__USER: ${AUTHENTIK_DB_USER}
+      AUTHENTIK_POSTGRESQL__NAME: ${AUTHENTIK_DB_NAME}
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${AUTHENTIK_DB_PASSWORD}
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY}
+      AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
+    volumes:
+      - ./data/authentik/media:/media
+      - authentik-templates:/templates
+    networks:
+      - auth
+    depends_on:
+      authentik-postgresql:
+        condition: service_healthy
+      authentik-redis:
         condition: service_healthy
     security_opt:
       - no-new-privileges:true
     restart: unless-stopped
 
-  # Demo service.
-  whoami:
-    image: traefik/whoami
+  # Log aggregation backend.
+  loki:
+    image: grafana/loki:3.4.2
+    command: -config.file=/etc/loki/loki.yml
+    volumes:
+      - ./configs/loki/loki.yml:/etc/loki/loki.yml:ro
+      - loki_data:/loki
+    networks:
+      - logging
+    healthcheck:
+      test:
+        ["CMD-SHELL", "wget -q --spider http://localhost:3100/ready || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+  # Log collector — scrapes Docker container logs via Docker socket.
+  alloy:
+    image: grafana/alloy:latest
+    volumes:
+      - ./configs/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+    networks:
+      - logging
+    depends_on:
+      loki:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+  # Log visualization.
+  grafana:
+    image: grafana/grafana:11.6.0
+    environment:
+      GF_SERVER_ROOT_URL: https://${GRAFANA_HOSTNAME}
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USERNAME}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+      # Native OAuth via Authentik — maps groups to Grafana roles.
+      GF_AUTH_GENERIC_OAUTH_ENABLED: "true"
+      GF_AUTH_GENERIC_OAUTH_NAME: Authentik
+      GF_AUTH_GENERIC_OAUTH_CLIENT_ID: ${AUTHENTIK_GRAFANA_CLIENT_ID}
+      GF_AUTH_GENERIC_OAUTH_CLIENT_SECRET: ${AUTHENTIK_GRAFANA_CLIENT_SECRET}
+      GF_AUTH_GENERIC_OAUTH_SCOPES: openid email profile
+      GF_AUTH_GENERIC_OAUTH_AUTH_URL: https://${AUTHENTIK_HOSTNAME}/application/o/authorize/
+      GF_AUTH_GENERIC_OAUTH_TOKEN_URL: https://${AUTHENTIK_HOSTNAME}/application/o/token/
+      GF_AUTH_GENERIC_OAUTH_API_URL: https://${AUTHENTIK_HOSTNAME}/application/o/userinfo/
+      # Map Authentik groups to Grafana roles. Adjust group names to match your Authentik setup.
+      GF_AUTH_GENERIC_OAUTH_ROLE_ATTRIBUTE_PATH: >-
+        contains(groups[*], 'role:grafana-admin') && 'Admin' ||
+        contains(groups[*], 'role:grafana-writer') && 'Editor' ||
+        contains(groups[*], 'role:grafana-reader') && 'Viewer'
+      # Deny login if the user is not in any of the above groups.
+      GF_AUTH_GENERIC_OAUTH_ROLE_ATTRIBUTE_STRICT: "true"
+      GF_AUTH_SIGNOUT_REDIRECT_URL: https://${AUTHENTIK_HOSTNAME}/application/o/grafana/end-session/
+      GF_AUTH_OAUTH_AUTO_LOGIN: "true"
+      GF_AUTH_GENERIC_OAUTH_TLS_CLIENT_CA: /etc/ssl/certs/ca.crt
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./configs/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./configs/traefik/certs/local.crt:/etc/ssl/certs/ca.crt:ro
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.whoami.rule=Host(`${DOMAIN}`) && PathPrefix(`/whoami`)"
-      - "traefik.http.routers.whoami.entrypoints=websecure"
-      - "traefik.http.routers.whoami.tls=true"
-      - "traefik.http.routers.whoami.middlewares=oauth2-proxy@file"
+      - "traefik.http.routers.grafana.rule=Host(`${GRAFANA_HOSTNAME}`)"
+      - "traefik.http.routers.grafana.entrypoints=websecure"
+      - "traefik.http.routers.grafana.tls=true"
+      - "traefik.http.services.grafana.loadbalancer.server.port=3000"
+    extra_hosts:
+      - "${AUTHENTIK_HOSTNAME}:host-gateway"
+    networks:
+      - proxy
+      - logging
+    depends_on:
+      loki:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+  # Demo API + frontend.
+  demo-api:
+    build: ./services/demo-api
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.demo.rule=Host(`${DOMAIN}`)"
+      - "traefik.http.routers.demo.entrypoints=websecure"
+      - "traefik.http.routers.demo.tls=true"
+      - "traefik.http.routers.demo.middlewares=authentik@file"
+      - "traefik.http.services.demo.loadbalancer.server.port=8080"
     networks:
       - proxy
     security_opt:
@@ -147,6 +243,11 @@ networks:
   proxy:
     name: proxy
   auth:
+  logging:
 
 volumes:
-  keycloak-postgres_data:
+  authentik-postgresql_data:
+  authentik-redis_data:
+  authentik-templates:
+  loki_data:
+  grafana_data:
